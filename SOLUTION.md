@@ -1,21 +1,22 @@
-# Solution: webhook-ingest
+# Solution: Webhook Ingest
 
-## What was broken and why
-Four main defects were causing the misbehavior:
-1. **Duplicate Webhooks (TOCTOU Race):** `EventExists` checked for duplicates before insertion. In concurrent scenarios, two identical deliveries would both pass the check and be inserted, causing duplicate calls and inflated account stats.
-2. **Missing Recordings (Context Cancellation):** The background goroutine handling recording downloads inherited the HTTP request `context.Context`. When the handler returned 200 OK, the framework immediately canceled the context, killing the background database queries and sleep timers. Errors were also completely swallowed.
-3. **Disappearing In-flight Work (No Graceful Background Shutdown):** During deployments, the server cleanly shut down the HTTP listener but had no mechanism to wait for running background goroutines, causing active tasks to drop mid-flight.
-4. **Data Race in Cache:** `stats.Cache.Record` modified the internal map without acquiring a mutex lock, which in Go is a critical data race that can lead to panics or missing increments.
+## What was broken (and why)
+When I started digging into the repo, I found four main issues causing the bugs:
+1. **TOCTOU race on inserts:** The `EventExists` check was happening before the insert. If two identical webhooks hit the server at the exact same time, both would pass the check and get inserted, leading to duplicate calls.
+2. **Context cancellation:** The goroutine processing the recordings was just inheriting the HTTP request's context. So the moment the server returned `200 OK`, the framework canceled that context and killed the background download and database updates.
+3. **No graceful shutdown:** When deployments happened, the server would shut down the HTTP listener but didn't wait for any background goroutines to finish. Any in-flight processing just disappeared into the void.
+4. **Cache data race:** `stats.Cache.Record` was updating its internal map without a mutex. This is a classic Go data race and was likely dropping increments or panicking under load.
 
 ## Deduplication Strategy
-I chose to handle deduplication at the database level by adding a `UNIQUE` constraint on `event_id` in Postgres and using an `INSERT ... ON CONFLICT DO NOTHING` statement. 
-**Why this approach?**
-- **Atomicity and Consistency:** Pushing the idempotency guarantee to a relational database provides robust atomicity without the overhead of maintaining distributed locks in Redis.
-- **Performance:** For our current throughput, avoiding a roundtrip to Redis for locking logic reduces latency. `ON CONFLICT` effectively provides a free "lock" and insert in one operation.
-- **Simplicity:** It eliminates the complex TOCTOU logic entirely and keeps our state in a single source of truth.
+To fix the idempotency issue, I decided to handle it straight at the database level by adding a `UNIQUE` constraint on `event_id` and using `ON CONFLICT DO NOTHING`. 
 
-## Scaling to 10,000 webhooks/second
-If throughput drastically increases to 10k/sec, the current architecture will face bottlenecks around Postgres connections, database locks, and unbounded goroutine spawning. Here's what I would change:
-1. **Event Driven / Queueing:** Instead of doing database inserts and spawning ad-hoc goroutines per request, the API handler should merely validate the webhook and push it to a high-throughput message queue (like Kafka, AWS SQS, or Redis Streams).
-2. **Worker Pool:** We would consume the queue with a dedicated worker pool. This controls concurrency, limits Postgres connections, and ensures tasks survive application restarts.
-3. **Redis Deduplication:** At 10k/sec, relying on Postgres unique constraints for deduplication could cause heavy index contention. We would use Redis `SETNX` (or a distributed lock) with a TTL to deduplicate events extremely quickly before they ever touch the message queue.
+I went with this approach over using Redis because:
+- The database gives us ACID guarantees essentially for free. We don't have to worry about the overhead or edge cases of distributed locks.
+- Given the current scale, `ON CONFLICT` is super fast and combines the lock and insert into a single query.
+- It completely removes the need for that race-prone `EventExists` check in our Go code, keeping the DB as the single source of truth.
+
+## Scaling to 10k webhooks/second
+If we suddenly had to process 10,000 webhooks a second, this architecture would probably fall over from Postgres connection exhaustion or too many goroutines. Here's how I'd change it:
+1. **Move to a Message Queue:** The API handler shouldn't touch Postgres at all. It should just do basic validation and immediately push the event onto a queue like Kafka, RabbitMQ, or Redis Streams.
+2. **Worker Pool:** I'd add a dedicated pool of workers to consume from that queue. This lets us carefully control concurrency and database connections without dropping things.
+3. **Redis Deduplication:** At 10k/sec, relying on a Postgres unique constraint would cause too much index contention. We'd want to deduplicate using Redis (like a `SETNX` with a TTL) right at the edge before the events even reach the queue.
